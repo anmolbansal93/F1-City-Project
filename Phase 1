@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import os
+import sys
+import warnings
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score, davies_bouldin_score, silhouette_samples
+from scipy.cluster.hierarchy import linkage, dendrogram
+
+plt.rcParams["figure.dpi"] = 140
+sns.set_context("talk")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# -------------------------------------------------------------------
+# Defaults (edit to your machine if running without CLI args)
+# -------------------------------------------------------------------
+DEFAULTS = dict(
+    input_path="/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/F1_DATASET_ENHANCED.csv",
+    outdir="/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/outputs/phase1",
+    id_col="city_canonical",
+    pca_components=5,
+    kmax=9,
+    k_provisional=4,
+    missing_strategy="impute-smart",  # "impute-smart" or "drop"
+    assume_standardized=False,        # if True, skip StandardScaler
+)
+
+ID_FALLBACK = "city_canonical"
+
+# Optional: features you *don’t* want in PCA (kept here for parity with your notes)
+DROP_FOR_PCA = ["circuit_age_years", "avg_attendance_k"]
+EXCLUDE_FROM_MODEL_LIST = ["airport_pax_per_capita", "visitors_per_capita", "rooms_per_1k_visitors"]
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def robust_read(path: str) -> pd.DataFrame:
+    try:
+        if str(path).lower().endswith(".xlsx"):
+            return pd.read_excel(path, engine="openpyxl")
+        try:
+            return pd.read_csv(path, engine="python")
+        except Exception:
+            return pd.read_csv(path)
+    except FileNotFoundError:
+        sys.exit(f"[FATAL] Input file not found: {path}")
+    except Exception as e:
+        sys.exit(f"[FATAL] Could not read input: {e}")
+
+def ensure_outdir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def coerce_numeric(df: pd.DataFrame, protected_cols) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if c in protected_cols:
+            continue
+        # quick pass
+        out[c] = pd.to_numeric(out[c], errors="ignore")
+        if out[c].dtype == "O":
+            s = out[c].astype(str)
+            s = s.str.replace(r"[,\u00A0\s]", "", regex=True)
+            s = s.str.replace(r"%$", "", regex=True)
+            s = s.replace({"NaN": np.nan, "nan": np.nan, "None": np.nan, "": np.nan})
+            try:
+                out[c] = pd.to_numeric(s, errors="coerce")
+            except Exception:
+                pass
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+def eda_summary(df_num: pd.DataFrame) -> pd.DataFrame:
+    desc = df_num.agg(['count', 'mean', 'std', 'min', 'median', 'max']).T
+    miss = df_num.isna().mean().rename('%missing') * 100
+    return desc.join(miss)
+
+def impute_smart(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if pd.api.types.is_numeric_dtype(out[c]):
+            med = out[c].median(skipna=True)
+            out[c] = out[c].fillna(med)
+    return out
+
+def safe_int(x, default):
+    try:
+        xi = int(x); return xi if xi > 0 else default
+    except Exception:
+        return default
+
+# ---------- Plot helpers ----------
+def biplot_top(ax, scores, loadings_scaled, var_names, city_names, topN=12):
+    """PCA biplot (PC1/PC2) using **scaled** loadings for proper geometry."""
+    imp = (np.abs(loadings_scaled[:, 0]) + np.abs(loadings_scaled[:, 1]))
+    keep_idx = np.argsort(-imp)[:min(topN, loadings_scaled.shape[0])]
+
+    ax.scatter(scores[:, 0], scores[:, 1], alpha=0.85)
+    for i, nm in enumerate(city_names):
+        ax.text(scores[i, 0], scores[i, 1], str(nm), fontsize=7)
+
+    for i in keep_idx:
+        ax.arrow(0, 0, loadings_scaled[i, 0], loadings_scaled[i, 1],
+                 head_width=0.05, length_includes_head=True, alpha=0.9)
+        ax.text(loadings_scaled[i, 0] * 1.08, loadings_scaled[i, 1] * 1.08,
+                var_names[i], fontsize=8)
+
+    ax.axhline(0, color='grey', lw=0.5); ax.axvline(0, color='grey', lw=0.5)
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.set_title("PCA Biplot (Top loadings only)")
+
+def _pretty_label(s: str, max_len: int = 34) -> str:
+    s = s.replace("_", " ")
+    s = re.sub(r"\b(19|20)\d{2}\b", "", s).strip()
+    return (s[:max_len] + "…") if len(s) > max_len else s
+
+def plot_loadings_heatmap(loadings_df: pd.DataFrame, topn: int, pcs: int, out_png: Path):
+    """
+    loadings_df: rows = features, cols = PC1..PCk (signed loadings)
+    Shows union of top-|loading| features across first `pcs` components.
+    """
+    use_pcs = [c for c in loadings_df.columns[:pcs]]
+    L = loadings_df[use_pcs].copy()
+
+    chosen = set()
+    for pc in use_pcs:
+        chosen.update(L[pc].abs().sort_values(ascending=False).head(topn).index.tolist())
+    L = L.loc[list(chosen), :]
+    L = L.loc[L[use_pcs[0]].abs().sort_values(ascending=False).index]
+
+    row_labels = [_pretty_label(r) for r in L.index]
+    n_rows = L.shape[0]
+    fig_h = max(6, 0.35 * n_rows)
+
+    plt.figure(figsize=(9, fig_h))
+    ax = sns.heatmap(
+        L.values, cmap="vlag", center=0.0,
+        annot=True, fmt=".2f", annot_kws={"fontsize": 8},
+        cbar=True, xticklabels=use_pcs, yticklabels=row_labels
+    )
+    ax.tick_params(axis='x', labelsize=10)
+    ax.tick_params(axis='y', labelsize=8)
+    plt.title(f"Top Loadings ({', '.join(use_pcs)})", fontsize=14, pad=12)
+    plt.subplots_adjust(left=0.38, right=0.97, top=0.92, bottom=0.05)
+    plt.savefig(out_png, dpi=220)
+    plt.close()
+
+def plot_silhouette_detail(scores_2d, labels, out_png):
+    """Classic per-sample silhouette chart for chosen k (KMeans labels)."""
+    try:
+        s_vals = silhouette_samples(scores_2d, labels)
+    except Exception:
+        warnings.warn("Silhouette detail plot skipped: could not compute samples.")
+        return
+    k = len(np.unique(labels))
+    y_lower = 10
+    plt.figure(figsize=(8, 6))
+    for c in sorted(np.unique(labels)):
+        sv = s_vals[labels == c]
+        sv.sort()
+        size = sv.shape[0]
+        y_upper = y_lower + size
+        plt.fill_betweenx(np.arange(y_lower, y_upper), 0, sv, alpha=0.7)
+        plt.text(-0.05, y_lower + 0.5*size, f"Cluster {c}")
+        y_lower = y_upper + 10
+    plt.axvline(np.mean(s_vals), color="red", linestyle="--", lw=1)
+    plt.xlabel("Silhouette coefficient")
+    plt.ylabel("Samples")
+    plt.title(f"Silhouette plot (k={k})")
+    plt.tight_layout()
+    plt.savefig(out_png)
+    plt.close()
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=False, help="Path to CSV/XLSX")
+    ap.add_argument("--outdir", default=DEFAULTS["outdir"])
+    ap.add_argument("--id_col", default=DEFAULTS["id_col"])
+    ap.add_argument("--pca_components", type=int, default=DEFAULTS["pca_components"])
+    ap.add_argument("--kmax", type=int, default=DEFAULTS["kmax"])
+    ap.add_argument("--k_provisional", type=int, default=DEFAULTS["k_provisional"])
+    ap.add_argument("--missing_strategy", choices=["drop", "impute-smart"],
+                    default=DEFAULTS["missing_strategy"])
+    ap.add_argument("--assume_standardized", action="store_true",
+                    help="Skip StandardScaler before PCA (input already z-scored).")
+
+    # No-CLI convenience: use defaults
+    if len(sys.argv) == 1:
+        class Args: pass
+        args = Args()
+        args.input = DEFAULTS["input_path"]
+        args.outdir = DEFAULTS["outdir"]
+        args.id_col = DEFAULTS["id_col"]
+        args.pca_components = DEFAULTS["pca_components"]
+        args.kmax = DEFAULTS["kmax"]
+        args.k_provisional = DEFAULTS["k_provisional"]
+        args.missing_strategy = DEFAULTS["missing_strategy"]
+        args.assume_standardized = DEFAULTS["assume_standardized"]
+        print("[INFO] No CLI arguments detected. Using local default paths.")
+    else:
+        args = ap.parse_args()
+
+    ensure_outdir(args.outdir)
+
+    # 1) Read & prep
+    df0 = robust_read(args.input)
+    if args.id_col not in df0.columns:
+        sys.exit(f"[FATAL] id_col '{args.id_col}' not found. Available: {list(df0.columns)}")
+    id_cols = [c for c in [args.id_col, "country", "iso3_country"] if c in df0.columns]
+
+    # 2) Build model column list
+    df = coerce_numeric(df0, protected_cols=id_cols)
+    numeric_cols = [c for c in df.columns if c not in id_cols and pd.api.types.is_numeric_dtype(df[c])]
+    pca_feature_candidates = [c for c in numeric_cols if c not in DROP_FOR_PCA]
+    model_cols = [c for c in pca_feature_candidates if c not in EXCLUDE_FROM_MODEL_LIST]
+
+    # Drop zero-variance columns
+    var_series = pd.Series({c: pd.to_numeric(df[c], errors="coerce").var() for c in model_cols})
+    zero_var = var_series[var_series.fillna(0) == 0].index.tolist()
+    if zero_var:
+        print(f"[WARN] Dropping zero-variance columns: {zero_var}")
+        model_cols = [c for c in model_cols if c not in zero_var]
+
+    # Warn near-zero variance (kept)
+    near_zero = var_series[(var_series > 0) & (var_series < 1e-8)].index.tolist()
+    if near_zero:
+        print(f"[WARN] Near-zero variance columns (kept but low information): {near_zero}")
+
+    if len(model_cols) < 2:
+        sys.exit(f"[FATAL] Need at least 2 numeric model columns; found {len(model_cols)}")
+
+    pd.Series(model_cols, name="model_input_columns").to_csv(
+        os.path.join(args.outdir, "model_input_columns.csv"), index=False
+    )
+
+    # 3) EDA summary
+    eda = eda_summary(df[model_cols])
+    eda.to_csv(os.path.join(args.outdir, "eda_summary.csv"))
+
+    # 4) Missing-data handling → analysis set
+    d = df[id_cols + model_cols].copy()
+    if args.missing_strategy == "drop":
+        d_ana = d.dropna(subset=model_cols).reset_index(drop=True)
+        miss_note = "drop"
+    else:
+        d_ana = d.copy()
+        d_ana[model_cols] = impute_smart(d_ana[model_cols], model_cols)
+        miss_note = "impute-smart"
+
+    if d_ana.empty:
+        sys.exit("[FATAL] No rows available for analysis after missing-data handling.")
+
+    pd.Series(d_ana[args.id_col].tolist(), name=args.id_col).to_csv(
+        os.path.join(args.outdir, "cities_used.csv"), index=False
+    )
+
+    # 5) Standardize & PCA
+    X = d_ana[model_cols].values
+    n_samples, n_features = X.shape
+
+    pca_comps = max(1, min(args.pca_components, n_samples, n_features))
+    if pca_comps < args.pca_components:
+        print(f"[WARN] Reducing PCA components from {args.pca_components} to {pca_comps} (limited by data).")
+
+    scaling_mode = "assumed_standardized" if args.assume_standardized else "standardized"
+    if args.assume_standardized:
+        Z = X.copy()
+    else:
+        scaler = StandardScaler()
+        Z = scaler.fit_transform(X)
+        pd.DataFrame({"mean": scaler.mean_, "scale": scaler.scale_}, index=model_cols).to_csv(
+            os.path.join(args.outdir, "scaler_mean_std.csv")
+        )
+
+    pca = PCA(n_components=pca_comps, random_state=42)
+    S = pca.fit_transform(Z)  # scores
+
+    # scaled loadings for biplot geometry (Gabriel biplot-style)
+    expl_var = pca.explained_variance_
+    loadings_scaled_2d = pca.components_.T[:, :2] * np.sqrt(expl_var[:2])
+
+    # Explained variance
+    ev = pd.DataFrame({
+        "pc": [f"PC{i+1}" for i in range(pca.n_components_)],
+        "explained_variance_ratio": pca.explained_variance_ratio_,
+        "cumulative_variance": np.cumsum(pca.explained_variance_ratio_)
+    })
+    ev.to_csv(os.path.join(args.outdir, "pca_explained_variance.csv"), index=False)
+
+    # Loadings (wide)
+    loadings = pd.DataFrame(
+        pca.components_.T,
+        index=model_cols,
+        columns=[f"PC{i+1}" for i in range(pca.n_components_)]
+    )
+    loadings.to_csv(os.path.join(args.outdir, "pca_loadings.csv"))
+
+    # Top-5 per PC table (tidy)
+    tidy = loadings.reset_index().melt(id_vars="index", var_name="pc", value_name="loading")
+    tidy = tidy.rename(columns={"index": "variable"})
+    tidy["abs_loading"] = tidy["loading"].abs()
+    tidy_sorted = tidy.sort_values(["pc", "abs_loading"], ascending=[True, False])
+    top_table = tidy_sorted.groupby("pc").head(5)[["pc", "variable", "loading", "abs_loading"]]
+    top_table.to_csv(os.path.join(args.outdir, "pca_top5_per_pc.csv"), index=False)
+
+    # PCA scores export
+    scores_df = pd.DataFrame(S, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
+    scores_df.insert(0, args.id_col, d_ana[args.id_col].values)
+    scores_df.to_csv(os.path.join(args.outdir, "pca_scores.csv"), index=False)
+
+    # 6) Scree & cumulative variance plots
+    plt.figure()
+    plt.plot(range(1, len(pca.explained_variance_ratio_)+1), pca.explained_variance_ratio_, marker='o')
+    plt.xlabel("Principal Component"); plt.ylabel("Explained Variance Ratio")
+    plt.title("Scree Plot"); plt.tight_layout()
+    plt.savefig(os.path.join(args.outdir, "figure_scree.png")); plt.close()
+
+    plt.figure()
+    plt.plot(range(1, len(pca.explained_variance_ratio_)+1),
+             np.cumsum(pca.explained_variance_ratio_), marker='o')
+    plt.xlabel("Principal Component"); plt.ylabel("Cumulative Explained Variance")
+    plt.title("Cumulative Variance"); plt.tight_layout()
+    plt.savefig(os.path.join(args.outdir, "figure_cumvar.png")); plt.close()
+
+    # 7) Biplot (PC1 vs PC2) with top variable arrows
+    if pca.n_components_ >= 2:
+        fig, ax = plt.subplots(figsize=(10, 7))
+        biplot_top(
+            ax,
+            scores=S[:, :2],
+            loadings_scaled=loadings_scaled_2d,
+            var_names=model_cols,
+            city_names=d_ana[args.id_col].tolist(),
+            topN=12
+        )
+        ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}% var)")
+        ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}% var)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.outdir, "figure_pca_biplot_top.png"))
+        plt.close()
+
+    # 8) Loadings heatmap (union of top-|loading| features across PC1–PC3)
+    pcs_for_heat = [c for c in ["PC1", "PC2", "PC3"] if c in loadings.columns]
+    if pcs_for_heat:
+        plot_loadings_heatmap(loadings, topn=12, pcs=len(pcs_for_heat),
+                              out_png=Path(args.outdir) / "figure_loadings_heatmap.png")
+
+    # 9) Hierarchical clustering (dendrogram) on PCA scores
+    try:
+        Zlink = linkage(S, method="ward")
+        plt.figure(figsize=(10, 5))
+        dendrogram(Zlink, labels=d_ana[args.id_col].tolist(), leaf_rotation=90)
+        plt.title("Hierarchical Clustering Dendrogram (Ward, PCA scores)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.outdir, "figure_dendrogram.png"))
+        plt.close()
+    except Exception as e:
+        warnings.warn(f"Dendrogram skipped: {e}")
+
+    # 10) Cluster model selection: KMeans & GMM (k=2..kmax)
+    rows = []
+    kmax_effective = max(2, min(args.kmax, n_samples - 1))
+    for k in range(2, kmax_effective + 1):
+        # KMeans
+        try:
+            km = KMeans(n_clusters=k, n_init=50, random_state=42)
+            lab_km = km.fit_predict(S)
+            sil_km = silhouette_score(S, lab_km) if len(set(lab_km)) > 1 else np.nan
+            dbi_km = davies_bouldin_score(S, lab_km) if len(set(lab_km)) > 1 else np.nan
+            rows.append(dict(model="KMeans", k=k, silhouette=sil_km, dbi=dbi_km))
+        except Exception:
+            rows.append(dict(model="KMeans", k=k, silhouette=np.nan, dbi=np.nan))
+
+        # GMM
+        try:
+            gmm = GaussianMixture(n_components=k, covariance_type="full",
+                                  random_state=42, n_init=10)
+            gmm.fit(S)
+            lab_gmm = gmm.predict(S)
+            sil_g = silhouette_score(S, lab_gmm) if len(set(lab_gmm)) > 1 else np.nan
+            dbi_g = davies_bouldin_score(S, lab_gmm) if len(set(lab_gmm)) > 1 else np.nan
+            rows.append(dict(model="GMM", k=k, silhouette=sil_g, dbi=dbi_g))
+        except Exception:
+            rows.append(dict(model="GMM", k=k, silhouette=np.nan, dbi=np.nan))
+
+    sel = pd.DataFrame(rows)
+    sel.to_csv(os.path.join(args.outdir, "cluster_model_selection.csv"), index=False)
+
+    # Silhouette summary lines
+    for mdl, fname in [("KMeans", "figure_silhouette_kmeans.png"),
+                       ("GMM", "figure_silhouette_gmm.png")]:
+        dfm = sel[sel.model == mdl].dropna(subset=["silhouette"])
+        plt.figure()
+        if not dfm.empty:
+            sns.lineplot(data=dfm, x="k", y="silhouette", marker="o")
+        else:
+            plt.text(0.5, 0.5, f"No valid silhouette scores for {mdl}", ha='center', va='center')
+            plt.axis('off')
+        plt.title(f"Silhouette ({mdl})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.outdir, fname))
+        plt.close()
+
+    # 11) Provisional clustering @ k (KMeans) with PC1-based label remap
+    k = safe_int(args.k_provisional, 4)
+    if k > n_samples - 1:
+        k = max(2, n_samples - 1)
+        print(f"[WARN] Reducing provisional k to {k} (limited by n_samples).")
+    if k < 2:
+        k = 2
+        print("[WARN] Provisional k < 2 is invalid; setting k=2.")
+
+    km = KMeans(n_clusters=k, n_init=50, random_state=42)
+    km_labels_raw = km.fit_predict(S)
+    centroids = km.cluster_centers_  # in PCA space
+
+    order = np.argsort(centroids[:, 0])  # sort clusters by PC1
+    remap = {old: new for new, old in enumerate(order)}
+    labels = np.array([remap[x] for x in km_labels_raw]) + 1  # 1..k
+
+    assign = d_ana[id_cols].copy()
+    assign["cluster_k"] = labels
+    assign.to_csv(os.path.join(args.outdir, f"cluster_assignments_kmeans_k{k}.csv"), index=False)
+
+    # Centroids (PCA space)
+    centroids_df = pd.DataFrame(centroids, columns=[f"PC{i+1}" for i in range(pca.n_components_)])
+    centroids_df.index = [f"cluster_{i}" for i in range(1, k+1)]
+    centroids_df.to_csv(os.path.join(args.outdir, f"cluster_centroids_kmeans_k{k}.csv"))
+
+    # Cluster profile (means in original units)
+    d_prof = df0.copy()
+    d_prof["_cluster"] = labels
+    prof = d_prof.groupby("_cluster").mean(numeric_only=True)
+    prof.to_csv(os.path.join(args.outdir, f"cluster_profile_table_kmeans_k{k}.csv"))
+
+    # Cluster sizes CSV
+    (assign["cluster_k"].value_counts()
+        .sort_index()
+        .rename("n")
+        .to_csv(os.path.join(args.outdir, f"cluster_sizes_k{k}.csv")))
+
+    # 12) PCA scatter (PC1 vs PC2) with clusters
+    if pca.n_components_ >= 2:
+        plt.figure(figsize=(8, 6))
+        for c in range(k):
+            idx = assign["cluster_k"].values == (c + 1)
+            plt.scatter(S[idx, 0], S[idx, 1], label=f"Cluster {c+1}", alpha=0.9)
+        leverage = np.abs(S[:, 0]) + np.abs(S[:, 1])
+        to_label_idx = leverage.argsort()[-min(14, len(leverage)):]
+        names = d_ana[args.id_col].tolist()
+        for i in to_label_idx:
+            plt.text(S[i, 0], S[i, 1], str(names[i]), fontsize=7, ha='left', va='bottom')
+        plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}% var)")
+        plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}% var)")
+        plt.title(f"PCA Map with KMeans Clusters (k={k})")
+        plt.legend(frameon=True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.outdir, f"figure_pca_k{k}.png"))
+        plt.close()
+
+        # Per-sample silhouette detail (uses PC1–PC2 map for legibility)
+        plot_silhouette_detail(S[:, :2], assign["cluster_k"].values,
+                               os.path.join(args.outdir, f"figure_silhouette_detail_k{k}.png"))
+
+    # 13) Manifest
+    manifest = {
+        "input_file": args.input,
+        "rows_total": int(df0.shape[0]),
+        "rows_used": int(d_ana.shape[0]),
+        "total_columns_available": int(df0.shape[1]),
+        "model_input_columns_count": len(model_cols),
+        "pca_components_used": int(pca.n_components_),
+        "pca_explained_variance_ratio": [float(x) for x in pca.explained_variance_ratio_],
+        "pca_cumulative_variance_total": float(np.cumsum(pca.explained_variance_ratio_)[-1]),
+        "kmax_effective": int(kmax_effective),
+        "provisional_k_used": int(k),
+        "missing_strategy": miss_note,
+        "scaling_mode": "assumed_standardized" if args.assume_standardized else "standardized",
+        "dropped_for_pca": DROP_FOR_PCA,
+        "excluded_from_model_list": EXCLUDE_FROM_MODEL_LIST,
+        "zero_variance_columns_dropped": zero_var,
+        "near_zero_variance_columns_warn": near_zero,
+        "id_columns": id_cols,
+    }
+    with open(os.path.join(args.outdir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print("[OK] Phase 1 artifacts written to:", args.outdir)
+
+if __name__ == "__main__":
+    main()
