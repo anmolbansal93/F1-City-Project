@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse, json, warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+plt.rcParams["figure.dpi"] = 140
+
+# -------- Defaults (edit paths if you want no-CLI run) --------
+DEFAULT_IN  = "/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/outputs/phase2"
+DEFAULT_OUT = "/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/outputs/phase3"
+
+# -------- Hand-crafted scenarios (will be pruned & renormalized to pillars) --------
+SCENARIOS_RAW = {
+    "equal": {
+        "Governance": 1, "Infrastructure": 1, "EconomicDemographic": 1, "ClimateEnv": 1,
+        "F1Context": 1, "MarketDemand": 1, "Sustainability": 1, "Luxury": 1,
+        "Risk": 1, "Readiness": 1
+    },
+    "fia_history": {
+        "Governance": 0.15, "Infrastructure": 0.20, "EconomicDemographic": 0.10, "ClimateEnv": 0.10,
+        "F1Context": 0.25, "MarketDemand": 0.10, "Sustainability": 0.05, "Luxury": 0.02,
+        "Risk": 0.02, "Readiness": 0.01
+    },
+    "infra_led": {
+        "Governance": 0.15, "Infrastructure": 0.25, "EconomicDemographic": 0.10, "ClimateEnv": 0.08,
+        "F1Context": 0.10, "MarketDemand": 0.10, "Sustainability": 0.07, "Luxury": 0.03,
+        "Risk": 0.05, "Readiness": 0.07
+    },
+    "economic_led": {
+        "Governance": 0.12, "Infrastructure": 0.15, "EconomicDemographic": 0.20, "ClimateEnv": 0.08,
+        "F1Context": 0.10, "MarketDemand": 0.20, "Sustainability": 0.05, "Luxury": 0.05,
+        "Risk": 0.03, "Readiness": 0.02
+    },
+    "sustainability": {
+        "Governance": 0.15, "Infrastructure": 0.12, "EconomicDemographic": 0.10, "ClimateEnv": 0.25,
+        "F1Context": 0.08, "MarketDemand": 0.10, "Sustainability": 0.20, "Luxury": 0.00,
+        "Risk": 0.00, "Readiness": 0.00
+    },
+}
+
+# ---------------- Helpers ----------------
+def ensure_outdir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def robust_read_csv(p: str) -> pd.DataFrame:
+    fp = Path(p)
+    if not fp.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    try:
+        return pd.read_csv(fp)
+    except Exception as e:
+        raise IOError(f"Error reading {p}: {e}")
+
+def detect_id_column(df: pd.DataFrame) -> str:
+    for c in ["city_canonical","city","City","name"]:
+        if c in df.columns: return c
+    return df.columns[0]
+
+def detect_pillars(pillar_csv: Path) -> tuple[list[str], str, pd.DataFrame]:
+    df = robust_read_csv(str(pillar_csv))
+    id_col = detect_id_column(df)
+    pillars = [c for c in df.columns if c != id_col]
+    if not pillars: raise SystemExit("[FATAL] pillar_zscores.csv has no pillar columns.")
+    return pillars, id_col, df[[id_col] + pillars].copy()
+
+def normalize_weight_map(weight_map: dict, pillars: list[str]) -> dict[str,float]:
+    sub = {k: float(v) for k,v in weight_map.items() if k in pillars}
+    if not sub:
+        return {p: 1.0/len(pillars) for p in pillars}
+    s = sum(sub.values())
+    if s == 0:
+        return {k: 1.0/len(sub) for k in sub}
+    return {k: v/s for k,v in sub.items()}
+
+def build_handcrafted_scenarios(pillars: list[str]) -> dict[str,dict[str,float]]:
+    out = {name: normalize_weight_map(w, pillars) for name, w in SCENARIOS_RAW.items()}
+    out["equal"] = {p: 1.0/len(pillars) for p in pillars}  # enforce full-equal
+    return out
+
+def pick_scoring_basis(indir: Path, pillars: list[str], id_col_hint: str, z_df: pd.DataFrame) -> tuple[pd.DataFrame,str]:
+    cfa_path = indir / "cfa_factor_scores.csv"
+    if not cfa_path.exists():
+        return z_df, "zscore"
+
+    df_cfa = robust_read_csv(str(cfa_path))
+    id_cfa = id_col_hint if id_col_hint in df_cfa.columns else detect_id_column(df_cfa)
+    cand = [c for c in df_cfa.columns if c != id_cfa]
+    cfa_cols = {}
+    for p in pillars:
+        if p in df_cfa.columns: cfa_cols[p] = p
+        else:
+            hits = [c for c in cand if p.lower() in c.lower()]
+            if hits: cfa_cols[p] = sorted(hits, key=len)[0]
+
+    cover = len([p for p in pillars if p in cfa_cols])
+    if cover >= max(2, int(0.6*len(pillars))):
+        out = pd.DataFrame({p: (df_cfa[cfa_cols[p]].values if p in cfa_cols else z_df[p].values)
+                            for p in pillars})
+        out.insert(0, z_df.columns[0], z_df.iloc[:,0].values)
+        return out[[z_df.columns[0]] + pillars].copy(), "cfa"
+    warnings.warn("[INFO] CFA factor scores exist but coverage is too low; using pillar Z.")
+    return z_df, "zscore"
+
+def composite(df_scores: pd.DataFrame, pillars: list[str], weights: dict[str,float]) -> pd.Series:
+    w = np.array([weights[p] for p in pillars], dtype=float)
+    return df_scores[pillars].values @ w
+
+def rank_series(v: pd.Series) -> pd.Series:
+    return v.rank(ascending=False, method="min").astype(int)
+
+def try_load_bootstrap_weights(indir: Path, d: int, seed: int, draws: int = 5000) -> np.ndarray:
+    path = indir / "bootstrap_weights.csv"
+    if path.exists():
+        B = robust_read_csv(str(path)).to_numpy(dtype=float)
+        if B.ndim == 2 and B.shape[1] == d:
+            return B
+        warnings.warn("bootstrap_weights.csv has unexpected shape; regenerating Dirichlet weights.")
+    rng = np.random.default_rng(seed)
+    return rng.dirichlet(np.ones(d), size=draws)
+
+def recompute_rank_intervals(df_scores: pd.DataFrame, pillars: list[str], B: np.ndarray, id_col: str) -> pd.DataFrame:
+    X = df_scores[pillars].to_numpy()
+    names = df_scores[id_col].tolist()
+    ranks = []
+    for w in B:
+        s = X @ w
+        ranks.append(pd.Series(s).rank(ascending=False, method="min").to_numpy())
+    R = np.vstack(ranks)
+    q05 = np.quantile(R, 0.05, axis=0); q50 = np.quantile(R, 0.50, axis=0); q95 = np.quantile(R, 0.95, axis=0)
+    return pd.DataFrame({id_col: names, "rank_p05": q05, "rank_p50": q50, "rank_p95": q95}).sort_values("rank_p50")
+
+def radar_plot(ax, values, labels, title=""):
+    N = len(labels)
+    thetas = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+    vals = values.tolist() + [values[0]]
+    thetas = thetas + [thetas[0]]
+    ax.plot(thetas, vals, linewidth=2); ax.fill(thetas, vals, alpha=0.15)
+    ax.set_xticks(thetas[:-1]); ax.set_xticklabels(labels)
+    ax.set_yticklabels([]); ax.set_title(title, y=1.08, fontsize=12)
+
+# -------- Auto weight builders --------
+def scenario_auto_pca_pillars(df_scores: pd.DataFrame, pillars: list[str]) -> dict[str,float]:
+    if len(pillars) < 2:  # degenerate
+        return {p: 1.0/len(pillars) for p in pillars}
+    X = df_scores[pillars].to_numpy()
+    pca = PCA(n_components=1).fit(X)
+    w = np.abs(pca.components_[0])         # length = #pillars
+    return {p: float(w[i]/(w.sum()+1e-12)) for i,p in enumerate(pillars)}
+
+def scenario_auto_variance(df_scores: pd.DataFrame, pillars: list[str]) -> dict[str,float]:
+    stds = df_scores[pillars].std(axis=0).replace(0, np.nan).fillna(0.0)
+    if stds.sum() == 0: return {p: 1.0/len(pillars) for p in pillars}
+    stds = stds / stds.sum()
+    return {p: float(stds[p]) for p in pillars}
+
+def scenario_auto_efa_communalities(indir: Path, pillars: list[str]) -> dict[str,float] | None:
+    map_path = indir / "manifest_phase2_used.csv"
+    com_path = indir / "efa_communalities.csv"
+    if not (map_path.exists() and com_path.exists()):
+        return None
+    m = robust_read_csv(str(map_path))
+    if not {"pillar","variable"}.issubset(m.columns): return None
+    c = robust_read_csv(str(com_path))
+    if not {"variable","communality"}.issubset(c.columns): return None
+    df = m.merge(c, on="variable", how="inner")
+    by = df.groupby("pillar")["communality"].mean()
+    by = by[by.index.isin(pillars)]
+    if by.empty or by.sum() == 0: return None
+    by = by / by.sum()
+    return {p: float(by.get(p, 0.0)) for p in pillars}
+
+# ---------------- Main ----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--indir",  default=DEFAULT_IN)
+    ap.add_argument("--outdir", default=DEFAULT_OUT)
+    ap.add_argument("--topn",   type=int, default=12)
+    ap.add_argument("--seed",   type=int, default=42)
+    args = ap.parse_args()
+
+    indir  = Path(args.indir); outdir = Path(args.outdir)
+    ensure_outdir(outdir)
+
+    # --- detect pillars + ID, load pillar_zscores
+    pillar_csv = indir / "pillar_zscores.csv"
+    if not pillar_csv.exists():
+        raise SystemExit(f"[FATAL] Missing required: {pillar_csv}")
+    pillars, id_col, pillarZ = detect_pillars(pillar_csv)
+
+    # --- pick basis (CFA when usable)
+    scores_df, basis = pick_scoring_basis(indir, pillars, id_col, pillarZ)
+    print(f"[INFO] Using scoring basis: {basis.upper()} | pillars={pillars}")
+
+    # --- scenarios: handcrafted + autos (all renormalized to detected pillars)
+    scenarios = build_handcrafted_scenarios(pillars)
+    scenarios["auto_pca_pillars"]      = scenario_auto_pca_pillars(scores_df, pillars)
+    scenarios["auto_variance_pillars"] = scenario_auto_variance(scores_df, pillars)
+    auto_com = scenario_auto_efa_communalities(indir, pillars)
+    if auto_com is not None:
+        scenarios["auto_efa_communalities"] = auto_com
+
+    # --- equal composite + ranks
+    w_equal = scenarios["equal"]
+    scores_df["score_equal"] = composite(scores_df, pillars, w_equal)
+    ranks_equal = scores_df[[id_col,"score_equal"]].copy()
+    ranks_equal["rank_equal"] = rank_series(ranks_equal["score_equal"])
+    ranks_equal = ranks_equal.sort_values("rank_equal")
+    ranks_equal.to_csv(outdir / "final_ranks_equal.csv", index=False)
+    scores_df.to_csv(outdir / "final_scores_equal.csv", index=False)
+
+    # --- scenario scores/ranks
+    rows_s, rows_r, rows_w = [], [], []
+    for name, w in scenarios.items():
+        rows_w.append({"scenario": name, **w})
+        s = composite(scores_df, pillars, w)
+        df = pd.DataFrame({id_col: scores_df[id_col], "scenario": name, "score": s})
+        rows_s.append(df)
+        r = df.copy(); r["rank"] = rank_series(r["score"]); rows_r.append(r)
+    scen_scores = pd.concat(rows_s, ignore_index=True)
+    scen_ranks  = pd.concat(rows_r, ignore_index=True)
+    pd.DataFrame(rows_w).to_csv(outdir / "scenario_weights.csv", index=False)
+    scen_scores.to_csv(outdir / "scenario_scores.csv", index=False)
+    scen_ranks.to_csv(outdir  / "scenario_ranks.csv",  index=False)
+
+    # --- rank stability (bootstrap over weight vectors)
+    B = try_load_bootstrap_weights(indir, d=len(pillars), seed=args.seed)
+    ri_in = indir / "rank_intervals.csv"
+    if ri_in.exists():
+        ri = robust_read_csv(str(ri_in))
+        if id_col not in ri.columns:
+            ri = ri.rename(columns={ri.columns[0]: id_col})
+        if "rank_p50" not in ri.columns and "rank_median" in ri.columns:
+            ri = ri.rename(columns={"rank_median": "rank_p50"})
+        ri = ri.sort_values("rank_p50")
+    else:
+        ri = recompute_rank_intervals(scores_df, pillars, B, id_col)
+        ri.to_csv(outdir / "rank_intervals_recomputed.csv", index=False)
+
+    stab = ri.copy()
+    stab["width_90"] = stab["rank_p95"] - stab["rank_p05"]
+    stab = stab[[id_col,"rank_p50","width_90","rank_p05","rank_p95"]].rename(columns={"rank_p50":"rank_median"})
+    stab.to_csv(outdir / "rank_stability_summary.csv", index=False)
+
+    # --- visuals (Top-N clamped)
+    topn = int(min(max(1, args.topn), len(ranks_equal)))
+    top_names = ranks_equal.head(topn)[id_col].tolist()
+
+    # 1) Radar grid (needs ≥3 pillars)
+    if len(pillars) >= 3:
+        radar_data = scores_df.set_index(id_col).loc[top_names, pillars]
+        col_min = scores_df[pillars].min(); col_max = scores_df[pillars].max()
+        denom = (col_max - col_min).replace(0, 1e-9)
+        radar_norm = (radar_data - col_min) / denom
+
+        ncols = min(4, max(2, int(np.ceil(np.sqrt(topn))))) if topn > 1 else 1
+        nrows = int(np.ceil(topn / ncols))
+        fig = plt.figure(figsize=(4.6*ncols, 4.8*nrows))
+        for i, city in enumerate(radar_norm.index):
+            ax = plt.subplot(nrows, ncols, i+1, projection="polar")
+            radar_plot(ax, radar_norm.loc[city, pillars].values, pillars, title=city)
+        plt.suptitle(f"Radar profiles (Top {topn}) — basis: {basis}", y=0.995, fontsize=14)
+        plt.tight_layout(rect=[0,0.02,1,0.97])
+        fig.savefig(outdir / f"figure_radar_top{topn}_{basis}.png", dpi=160)
+        plt.close(fig)
+    else:
+        warnings.warn(f"[INFO] Only {len(pillars)} pillar(s) detected — skipping radar plot (needs ≥3).")
+
+    # 2) Scenario comparison bars (use overlapping names & present scenarios)
+    scen_order = [s for s in [
+        "equal","fia_history","infra_led","economic_led","sustainability",
+        "auto_pca_pillars","auto_variance_pillars","auto_efa_communalities"
+    ] if s in scenarios]
+    pv = scen_scores.pivot(index=id_col, columns="scenario", values="score")
+    pv = pv.loc[[n for n in top_names if n in pv.index], [c for c in scen_order if c in pv.columns]]
+    fig, ax = plt.subplots(figsize=(max(6, 1.2*len(pv.index)+4), 6))
+    pv.plot(kind="bar", ax=ax)
+    ax.set_ylabel("Composite score (higher = better)")
+    ax.set_title(f"Scenario comparison — Top {len(pv.index)} (basis: {basis})")
+    ax.legend(title="Scenario")
+    plt.xticks(rotation=45, ha="right"); plt.tight_layout()
+    fig.savefig(outdir / f"figure_scenario_compare_top{len(pv.index)}_{basis}.png", dpi=160)
+    plt.close(fig)
+
+    # 3) Rank-stability fan
+    ts = stab.set_index(id_col).loc[[n for n in top_names if n in stab[id_col].values]].reset_index()
+    fig, ax = plt.subplots(figsize=(12, 7))
+    y = np.arange(len(ts))[::-1]
+    for i, row in enumerate(ts.itertuples()):
+        ax.plot([row.rank_p05, row.rank_p95], [y[i], y[i]], lw=3)
+        ax.scatter([row.rank_median], [y[i]], s=60)
+    ax.set_yticks(y); ax.set_yticklabels(ts[id_col].tolist())
+    ax.set_xlabel("Rank (lower is better)")
+    ax.set_title("Rank stability (5%–95%) — Top candidates")
+    ax.invert_xaxis(); ax.grid(True, alpha=0.3, axis="x")
+    plt.tight_layout(); fig.savefig(outdir / "figure_rank_stability_topN.png", dpi=160); plt.close(fig)
+
+    # --- manifest
+    manifest = {
+        "indir": str(indir.resolve()),
+        "outdir": str(outdir.resolve()),
+        "basis": basis,
+        "pillars": pillars,
+        "id_col": id_col,
+        "topn": int(topn),
+        "bootstrap_draws_used": int(B.shape[0]),
+        "scenarios_final": scenarios,
+        "files_read": {
+            "pillar_zscores": str(pillar_csv),
+            "cfa_factor_scores": str(indir / "cfa_factor_scores.csv"),
+            "bootstrap_weights": str(indir / "bootstrap_weights.csv"),
+            "rank_intervals_in": str(indir / "rank_intervals.csv"),
+            "manifest_phase2_used": str(indir / "manifest_phase2_used.csv"),
+            "efa_communalities": str(indir / "efa_communalities.csv")
+        },
+        "files_written": [
+            "final_scores_equal.csv","final_ranks_equal.csv",
+            "scenario_weights.csv","scenario_scores.csv","scenario_ranks.csv",
+            "rank_stability_summary.csv",
+            "figure_radar_topN_*.png","figure_scenario_compare_topN_*.png","figure_rank_stability_topN.png",
+            "manifest_phase3.json"
+        ]
+    }
+    (outdir / "manifest_phase3.json").write_text(json.dumps(manifest, indent=2))
+    print("[OK] Phase 3 artifacts written to:", outdir)
+
+if __name__ == "__main__":
+    main()
