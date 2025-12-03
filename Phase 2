@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse, json, os, sys, warnings
+from pathlib import Path
+from collections import OrderedDict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import spearmanr
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import FactorAnalysis, PCA
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score, adjusted_rand_score
+
+plt.rcParams["figure.dpi"] = 140
+sns.set_context("talk")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ---------- Defaults (your paths) ----------
+DEFAULTS = dict(
+    data="/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/F1_DATASET_ENHANCED.csv",
+    mapping="/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/manifest_phase2.csv",
+    outdir="/Users/anmolbansal/Documents/F1 Project Dataset/FINAL/outputs/phase2",
+    id_col="city_canonical",
+    assume_standardized=False,
+    n_factors=0,
+    rotation="varimax",
+    random_state=42,
+    kmin=2,
+    kmax=9,
+    bootstrap_reps=50,
+)
+
+# ---------- Helpers ----------
+def robust_read_csv(path: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, engine="python")
+    except Exception:
+        return pd.read_csv(path)
+
+def ensure_outdir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def numeric_df(df: pd.DataFrame, keep: list) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if c in keep: continue
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+def varimax(Phi, gamma=1.0, q=20, tol=1e-6):
+    p, k = Phi.shape
+    R = np.eye(k); d=0.0
+    for _ in range(q):
+        d_old = d
+        Lambda = Phi @ R
+        M = Phi.T @ (Lambda**3 - (gamma/p)*(Lambda @ np.diag(np.diag(Lambda.T @ Lambda))))
+        u, s, vh = np.linalg.svd(M, full_matrices=False)
+        R = u @ vh; d = np.sum(s)
+        if d_old and (d - d_old) < tol: break
+    return Phi @ R, R
+
+def heatmap_save(mat: pd.DataFrame, title: str, path, center=0.0, fmt=".2f"):
+    # Clamp color scale to [-1, 1] for loadings so colors are comparable
+    vmin, vmax = (-1.0, 1.0)
+
+    # Size scales with rows/cols but stays readable
+    n_rows, n_cols = mat.shape
+    fig_h = max(4.5, 0.38 * n_rows)   # taller for more rows
+    fig_w = max(6.5, 1.00 * n_cols)   # wider for more factors
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    sns.heatmap(
+        mat,
+        ax=ax,
+        annot=True,
+        fmt=fmt,
+        cmap="vlag",
+        center=center,
+        vmin=vmin,
+        vmax=vmax,
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"shrink": 0.6, "label": "|loading|" if center is None else "loading"},
+        annot_kws={"fontsize": 8, "clip_on": True},
+    )
+
+    ax.set_title(title, pad=10)
+    ax.tick_params(axis="x", rotation=0, labelsize=9)
+    ax.tick_params(axis="y", labelsize=9)
+
+    # Make sure nothing is clipped and labels don’t overlap
+    plt.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+def prune_high_corr(dfZ: pd.DataFrame, vars_list: list, threshold=0.97):
+    Zdf = dfZ[vars_list]; corr = Zdf.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    to_drop=set()
+    for col in upper.columns:
+        high=[idx for idx,v in upper[col].dropna().items() if v>threshold]
+        if high: to_drop.update(high)
+    kept=[v for v in vars_list if v not in to_drop]
+    return kept, sorted(list(to_drop))
+
+def spearman_safe(a, b):
+    if np.all(np.isfinite(a)) and np.all(np.isfinite(b)):
+        r, p = spearmanr(a, b)
+        return float(r), float(p)
+    return np.nan, np.nan
+
+def fuzzy_match_columns(candidates, target_name):
+    t=str(target_name).lower()
+    hits=[c for c in candidates if t in c.lower()]
+    return sorted(hits, key=len)[0] if hits else None
+
+# ---------- Main ----------
+def main():
+    # CLI
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default=DEFAULTS["data"])
+    ap.add_argument("--mapping", default=DEFAULTS["mapping"])
+    ap.add_argument("--outdir", default=DEFAULTS["outdir"])
+    ap.add_argument("--id_col", default=DEFAULTS["id_col"])
+    ap.add_argument("--assume_standardized", action="store_true", default=DEFAULTS["assume_standardized"])
+    ap.add_argument("--n_factors", type=int, default=DEFAULTS["n_factors"])
+    ap.add_argument("--rotation", choices=["varimax","none"], default=DEFAULTS["rotation"])
+    ap.add_argument("--random_state", type=int, default=DEFAULTS["random_state"])
+    ap.add_argument("--kmin", type=int, default=DEFAULTS["kmin"])
+    ap.add_argument("--kmax", type=int, default=DEFAULTS["kmax"])
+    ap.add_argument("--bootstrap_reps", type=int, default=DEFAULTS["bootstrap_reps"])
+
+    if len(sys.argv)==1:
+        class Args: pass
+        args=Args()
+        for k,v in DEFAULTS.items(): setattr(args, k, v)
+        print("[INFO] No CLI args provided. Using defaults.")
+    else:
+        args=ap.parse_args()
+
+    rng = np.random.default_rng(args.random_state)
+    ensure_outdir(args.outdir)
+
+    # --- 1) Read data + mapping
+    df = robust_read_csv(args.data)
+    if args.id_col not in df.columns:
+        sys.exit(f"[FATAL] id_col '{args.id_col}' not found. Available: {list(df.columns)}")
+
+    mapping = robust_read_csv(args.mapping)
+    required = {"pillar","variable","sign"}
+    if not required.issubset(set(mapping.columns)):
+        pd.DataFrame(columns=["pillar","variable","sign"]).to_csv(Path(args.outdir,"MAPPING_TEMPLATE_EMPTY.csv"), index=False)
+        sys.exit(f"[FATAL] mapping must have columns {required}. Template written to outputs.")
+
+    mapping = mapping[mapping["variable"].isin(df.columns)].copy()
+    if mapping.empty: sys.exit("[FATAL] Mapping is empty after aligning to dataset columns.")
+
+    pillars = list(OrderedDict.fromkeys(mapping["pillar"].tolist()))
+    var_list_all = mapping["variable"].tolist()
+    var_sign = dict(zip(mapping["variable"], mapping["sign"].astype(float)))
+
+    id_cols = [c for c in [args.id_col,"country","iso3_country"] if c in df.columns]
+    df_num = numeric_df(df, keep=id_cols)
+
+    # --- 2) Build model matrix with sign alignment
+    X_raw = df_num[var_list_all].copy()
+    for v in var_list_all:
+        X_raw[v] = pd.to_numeric(X_raw[v], errors="coerce") * var_sign.get(v, 1.0)
+
+    # Impute & scale
+    for v in var_list_all:
+        med = X_raw[v].median(skipna=True); X_raw[v]=X_raw[v].fillna(med)
+
+    if args.assume_standardized:
+        Z_full = X_raw.values; scaling_mode="assumed_standardized"
+    else:
+        scaler=StandardScaler(); Z_full=scaler.fit_transform(X_raw.values)
+        pd.DataFrame({"variable":var_list_all,"mean":scaler.mean_,"scale":scaler.scale_}).to_csv(Path(args.outdir,"scaler_mean_std.csv"), index=False)
+        scaling_mode="standardized"
+
+    Zdf_full=pd.DataFrame(Z_full, columns=var_list_all)
+    n_obs=Zdf_full.shape[0]
+
+    # --- 3) Pillar Z-scores (always based on ALL mapped vars)
+    pillar_scores={}
+    for p in pillars:
+        cols=[v for v in mapping.loc[mapping["pillar"]==p,"variable"].tolist() if v in Zdf_full.columns]
+        if cols: pillar_scores[p]=Zdf_full[cols].mean(axis=1).values
+    pillar_df=pd.DataFrame(pillar_scores); pillar_df.insert(0, args.id_col, df[args.id_col].values)
+    pillar_df.to_csv(Path(args.outdir,"pillar_zscores.csv"), index=False)
+
+    # --- 4) Collinearity prune for modeling set (does NOT affect pillar z-scores)
+    kept, dropped = prune_high_corr(Zdf_full, var_list_all, threshold=0.97)
+    if len(dropped)>0:
+        warnings.warn(f"[WARN] High collinearity: dropping {len(dropped)} vars before EFA/CFA: {dropped}")
+    var_list = kept; Z = Zdf_full[var_list].values; n_vars=len(var_list)
+
+    # --- 5) Choose #factors
+    if args.n_factors>0: n_factors=args.n_factors
+    else:
+        n_factors = min(len(pillars), 5, n_vars, max(1, n_obs-3))
+        n_factors = max(1, min(n_factors, n_vars))
+    small_n_flag = n_obs < 5*n_factors
+
+    # --- 6) EFA (FactorAnalysis) + optional varimax
+    fa = FactorAnalysis(n_components=n_factors, random_state=args.random_state)
+    fa_scores = fa.fit_transform(Z)
+    loadings = fa.components_.T
+    if args.rotation=="varimax":
+        load_rot, R = varimax(loadings); load_used=load_rot; Rmat=R
+    else:
+        load_used=loadings; Rmat=np.eye(n_factors)
+
+    # Exports (EFA)
+    efa_scores_df = pd.DataFrame(fa_scores, columns=[f"F{i+1}" for i in range(n_factors)])
+    efa_scores_df.insert(0, args.id_col, df[args.id_col].values)
+    efa_scores_df.to_csv(Path(args.outdir,"efa_factor_scores.csv"), index=False)
+
+    efa_load_df = pd.DataFrame(load_used, index=var_list, columns=[f"F{i+1}" for i in range(n_factors)])
+    efa_load_df.to_csv(Path(args.outdir,"efa_loadings.csv"))
+    communalities = (load_used**2).sum(axis=1)
+    pd.DataFrame({"variable":var_list,"communality":communities if (communities:=communalities) is not None else communalities}).to_csv(Path(args.outdir,"efa_communalities.csv"), index=False)
+    pd.DataFrame(Rmat, index=[f"F{i+1}" for i in range(n_factors)], columns=[f"F{i+1}" for i in range(n_factors)]).to_csv(Path(args.outdir,"efa_rotation_matrix.csv"))
+
+    corrZ = pd.DataFrame(Z, columns=var_list).corr()
+    corrZ.to_csv(Path(args.outdir,"efa_corr_matrix.csv"))
+    eigvals = np.linalg.eigvalsh(np.nan_to_num(corrZ.values))
+    pd.DataFrame({"eigenvalue": np.sort(eigvals)[::-1]}).to_csv(Path(args.outdir,"efa_corr_eigenvalues.csv"), index=False)
+
+    max_abs = np.abs(efa_load_df).max(axis=1)
+    top_vars = max_abs.sort_values(ascending=False).head(min(25, len(max_abs))).index
+    heatmap_save(efa_load_df.loc[top_vars], "EFA Loadings (Top Variables)", Path(args.outdir,"figure_efa_loadings_heatmap.png"))
+
+    # --- 7) Build CFA set with guards
+    # indicators surviving prune per pillar
+    pillar_to_survivors = {p: [v for v in mapping[mapping["pillar"]==p]["variable"] if v in var_list] for p in pillars}
+    cfa_vars = set(var_list)
+    for p in pillars:
+        if len(pillar_to_survivors[p])<2:
+            pool=[v for v in mapping[mapping["pillar"]==p]["variable"] if v in Zdf_full.columns]
+            for v in pool:
+                cfa_vars.add(v)
+                if len([x for x in pool if x in cfa_vars])>=2: break
+    cfa_vars=list(cfa_vars)
+
+    # Build CFA Z matrix from original imputed/sign-aligned values:
+    Z_cfa = Zdf_full[cfa_vars].copy()
+    zdf_cfa = pd.DataFrame(Z_cfa, columns=cfa_vars); zdf_cfa.insert(0, args.id_col, df[args.id_col].values)
+
+    # Guard 1: drop near-zero variance
+    stds = zdf_cfa.drop(columns=[args.id_col]).std(axis=0).replace(0, np.nan)
+    low_var_cols = stds[stds < 1e-6].index.tolist()
+    if low_var_cols:
+        warnings.warn(f"[WARN] Dropping {len(low_var_cols)} near-zero-variance indicators from CFA: {low_var_cols}")
+        zdf_cfa = zdf_cfa.drop(columns=low_var_cols)
+
+    # Guard 2: cap indicators per pillar
+    MAX_PER_PILLAR = 3
+    keep_cols=[args.id_col]
+    for p in pillars:
+        p_vars_all=[v for v in mapping[mapping["pillar"]==p]["variable"] if v in zdf_cfa.columns]
+        if len(p_vars_all)>MAX_PER_PILLAR:
+            pillar_stds=zdf_cfa[p_vars_all].std(axis=0).sort_values(ascending=False)
+            p_keep=pillar_stds.index[:MAX_PER_PILLAR].tolist()
+        else:
+            p_keep=p_vars_all
+        keep_cols+=p_keep
+    keep_cols=[args.id_col]+sorted(set(keep_cols)-{args.id_col})
+    zdf_cfa=zdf_cfa[keep_cols]
+
+    # CFA indicator audit
+    rows=[]
+    for p in pillars:
+        cols_p=[v for v in zdf_cfa.columns if v!=args.id_col and v in mapping[mapping["pillar"]==p]["variable"].tolist()]
+        rows.append({"pillar":p,"cfa_indicators":len(cols_p),"indicators_list":";".join(cols_p)})
+    pd.DataFrame(rows).to_csv(Path(args.outdir,"cfa_indicator_audit.csv"), index=False)
+
+    # --- 8) CFA try (version-safe)
+    have_semopy = False;
+    cfa_factor_scores = None;
+    cfa_factor_corr = None;
+    cfa_fitstats_available = False;
+    chosen_obj = None
+    try:
+        import semopy
+        have_semopy = True
+
+        # tiny jitter to avoid singular covariances
+        zdf = zdf_cfa.copy()
+        if zdf.shape[1] > 2:
+            noise = rng.normal(0.0, 1e-4, size=zdf.drop(columns=[args.id_col]).shape)
+            zdf.loc[:, zdf.columns != args.id_col] = zdf.drop(columns=[args.id_col]).values + noise
+
+        # build model: only pillars with >=2 indicators present
+        lines = [];
+        pillars_cfa = []
+        for p in pillars:
+            p_vars = [v for v in mapping[mapping["pillar"] == p]["variable"] if v in zdf.columns]
+            if len(p_vars) >= 2:
+                lines.append(f"{p} =~ " + " + ".join(p_vars))
+                pillars_cfa.append(p)
+        if not lines:
+            raise RuntimeError("No pillars with ≥2 indicators after alignment; skipping CFA.")
+        model_desc = "\n".join(lines)
+
+        fit_ok = False;
+        last_err = None
+        for obj in ["MLW", "DWLS", "GLS"]:
+            try:
+                mod = semopy.Model(model_desc)
+                mod.fit(zdf, obj=obj)
+                chosen_obj = obj
+                fit_ok = True
+                break
+            except Exception as e:
+                last_err = e
+        if not fit_ok:
+            raise RuntimeError(f"CFA failed across estimators (MLW/DWLS/GLS). Last error: {last_err}")
+
+        # ---- standardized loadings (handle different semopy APIs)
+        est_df = None
+        try:
+            est_df = semopy.inspect(mod, what="est_std")  # newer API
+        except Exception:
+            try:
+                from semopy.inspector import inspect as sem_inspect  # alt API
+                est_df = sem_inspect(mod, what="est_std")
+            except Exception:
+                try:
+                    tmp = mod.inspect(std_est=True)  # older API (returns DataFrame)
+                    # expected columns: lval (factor), rval (indicator), op, est
+                    if {"lval", "rval", "op"}.issubset(set(tmp.columns)):
+                        tmp = tmp[tmp["op"] == "=~"].copy()
+                        tmp.rename(columns={"lval": "factor", "rval": "indicator", "est": "Est.Std"}, inplace=True)
+                        est_df = tmp
+                except Exception:
+                    est_df = None
+
+        if est_df is not None and not est_df.empty:
+            load_rows = est_df[est_df["op"] == "=~"][
+                ["factor", "indicator", "Est.Std"]].copy() if "op" in est_df.columns else est_df[
+                ["factor", "indicator", "Est.Std"]].copy()
+            load_rows.rename(columns={"Est.Std": "std_loading"}, inplace=True)
+            load_rows.to_csv(Path(args.outdir, "cfa_standardized_loadings.csv"), index=False)
+
+        # ---- fit indices (version-safe)
+        fit_row = {"n": len(zdf), "df": None, "chi2": None, "p_chi2": None, "rmsea": None, "srmr": None, "cfi": None,
+                   "tli": None}
+        try:
+            try:
+                from semopy import calc_stats
+            except Exception:
+                from semopy.stats import calc_stats  # older location
+            stats = calc_stats(mod, zdf)
+            fit_row.update(dict(df=getattr(stats, "dof", None),
+                                chi2=getattr(stats, "chi2", None),
+                                p_chi2=getattr(stats, "p_value", None),
+                                rmsea=getattr(stats, "rmsea", None),
+                                srmr=getattr(stats, "srmr", None),
+                                cfi=getattr(stats, "cfi", None),
+                                tli=getattr(stats, "tli", None)))
+            cfa_fitstats_available = True
+        except Exception:
+            pass
+        pd.DataFrame([fit_row]).to_csv(Path(args.outdir, "cfa_fit_indices.csv"), index=False)
+
+        # ---- factor scores (version-safe)
+        try:
+            fs = mod.predict_factors(zdf)  # newer
+        except Exception:
+            try:
+                fs = mod.predict(zdf)  # older
+            except Exception:
+                fs = None
+        if fs is not None:
+            cfa_cols = [c for c in fs.columns if
+                        (c in pillars) or any(c.lower().startswith(p.lower()) for p in pillars)]
+            if not cfa_cols: cfa_cols = list(fs.columns)
+            cfa_factor_scores = fs[cfa_cols].copy()
+            cfa_factor_scores.insert(0, args.id_col, df[args.id_col].values)
+            cfa_factor_scores.to_csv(Path(args.outdir, "cfa_factor_scores.csv"), index=False)
+
+        # ---- factor correlations
+        try:
+            lat_cov = mod.inspect("mx_psi")
+            d = np.sqrt(np.diag(lat_cov));
+            corr = lat_cov / np.outer(d, d)
+            cfa_factor_corr = pd.DataFrame(corr, index=pillars_cfa, columns=pillars_cfa)
+        except Exception:
+            if cfa_factor_scores is not None:
+                use = [c for c in cfa_factor_scores.columns if c in pillars]
+                if len(use) >= 2:
+                    cfa_factor_corr = cfa_factor_scores[use].corr()
+
+        if cfa_factor_corr is not None:
+            heatmap_save(cfa_factor_corr, "CFA Factor Correlations", Path(args.outdir, "figure_cfa_factor_corr.png"))
+            cfa_factor_corr.to_csv(Path(args.outdir, "cfa_factor_correlations.csv"))
+
+    except Exception as e:
+        warnings.warn(f"[INFO] CFA skipped due to import/fit issue: {e}")
+        have_semopy = False
+
+    # --- 9) Convergent validity + rank coherence
+    eq_comp_z = pillar_df[pillars].values.mean(axis=1) if pillars else np.zeros(n_obs)
+    conv_rows=[]; eq_comp_ref=None; ref_label=None
+
+    if have_semopy and (cfa_factor_scores is not None):
+        cfa_matched={}
+        for p in pillars:
+            exact=p if p in cfa_factor_scores.columns else fuzzy_match_columns(list(cfa_factor_scores.columns), p)
+            if exact is not None: cfa_matched[p]=cfa_factor_scores[exact].values
+        for p in pillars:
+            if p in cfa_matched:
+                r,pv=spearman_safe(pillar_df[p].values, cfa_matched[p]); conv_rows.append({"pillar":p,"spearman_rho":r,"p_value":pv,"basis":"CFA"})
+        if cfa_matched:
+            eq_comp_ref=np.vstack([cfa_matched[p] for p in cfa_matched.keys()]).mean(axis=0); ref_label="CFA"
+
+    if eq_comp_ref is None:
+        efa_scores_core=efa_scores_df.drop(columns=[args.id_col])
+        chosen_factors=[]
+        for p in pillars:
+            best_r,best_f=-np.inf,None
+            for fcol in efa_scores_core.columns:
+                r,_=spearman_safe(pillar_df[p].values, efa_scores_core[fcol].values)
+                if np.isfinite(r) and abs(r)>abs(best_r): best_r, best_f=r, fcol
+            if best_f is not None:
+                conv_rows.append({"pillar":p,"spearman_rho":float(best_r),"p_value":np.nan,"basis":"EFA"})
+                chosen_factors.append(best_f)
+        mapped_unique=[]
+        for f in chosen_factors:
+            if f not in mapped_unique: mapped_unique.append(f)
+        if mapped_unique:
+            eq_comp_ref=efa_scores_core[mapped_unique].values.mean(axis=1); ref_label="EFA"
+
+    pd.DataFrame(conv_rows).to_csv(Path(args.outdir,"pillar_convergent_validity_spearman.csv"), index=False)
+
+    if eq_comp_ref is None: eq_comp_ref=eq_comp_z; ref_label="Z"
+    ranks=pd.DataFrame({args.id_col: df[args.id_col].values,
+                        "rank_z_equal": (-eq_comp_z).argsort().argsort()+1,
+                        "rank_ref_equal": (-eq_comp_ref).argsort().argsort()+1,
+                        "reference": ref_label})
+    ranks.to_csv(Path(args.outdir,"rank_comparison_cfa_vs_z.csv"), index=False)
+
+    plt.figure(figsize=(6,5))
+    plt.scatter(ranks["rank_z_equal"], ranks["rank_ref_equal"], alpha=0.85)
+    names=df[args.id_col].values; step=max(1, round(len(ranks)/20))
+    for i in range(0, len(ranks), step):
+        plt.text(ranks["rank_z_equal"].iloc[i], ranks["rank_ref_equal"].iloc[i], str(names[i]), fontsize=7)
+    plt.xlabel("Rank (Equal-weight pillar Z)"); plt.ylabel(f"Rank (Equal-weight {ref_label})")
+    plt.title(f"Rank Coherence: Z vs {ref_label}"); plt.tight_layout()
+    plt.savefig(Path(args.outdir,"figure_rank_scatter_cfa_vs_z.png")); plt.close()
+
+    # --- 10) Model Selection (KMeans & GMM across K) + stability
+    # Use PCA scores for clustering space (robust)
+    pca = PCA(n_components=min(10, Z.shape[1], max(2, Z.shape[0]-2)))
+    Zp = pca.fit_transform(Z)
+
+    rows_kmeans=[]; rows_gmm=[]; elbow=[]
+    for k in range(max(2,args.kmin), min(args.kmax, Zp.shape[0]-1)+1):
+        # KMeans
+        try:
+            km=KMeans(n_clusters=k, n_init=50, random_state=args.random_state).fit(Zp)
+            lab=km.labels_
+            rows_kmeans.append(dict(K=k,
+                                    silhouette=float(silhouette_score(Zp, lab)) if len(set(lab))>1 else np.nan,
+                                    davies_bouldin=float(davies_bouldin_score(Zp, lab)) if len(set(lab))>1 else np.nan,
+                                    calinski_harabasz=float(calinski_harabasz_score(Zp, lab)) if len(set(lab))>1 else np.nan))
+            elbow.append(dict(K=k, inertia=float(km.inertia_)))
+        except Exception:
+            rows_kmeans.append(dict(K=k, silhouette=np.nan, davies_bouldin=np.nan, calinski_harabasz=np.nan))
+            elbow.append(dict(K=k, inertia=np.nan))
+        # GMM
+        try:
+            gmm=GaussianMixture(n_components=k, covariance_type="full", n_init=10, random_state=args.random_state).fit(Zp)
+            lab=gmm.predict(Zp); aic=float(gmm.aic(Zp)); bic=float(gmm.bic(Zp))
+            rows_gmm.append(dict(K=k,
+                                 silhouette=float(silhouette_score(Zp, lab)) if len(set(lab))>1 else np.nan,
+                                 davies_bouldin=float(davies_bouldin_score(Zp, lab)) if len(set(lab))>1 else np.nan,
+                                 calinski_harabasz=float(calinski_harabasz_score(Zp, lab)) if len(set(lab))>1 else np.nan,
+                                 AIC=aic, BIC=bic))
+        except Exception:
+            rows_gmm.append(dict(K=k, silhouette=np.nan, davies_bouldin=np.nan, calinski_harabasz=np.nan, AIC=np.nan, BIC=np.nan))
+
+    df_km=pd.DataFrame(rows_kmeans); df_gmm=pd.DataFrame(rows_gmm); df_elbow=pd.DataFrame(elbow)
+    df_km.to_csv(Path(args.outdir,"figure_kmeans_metrics.csv").with_name("kmeans_metrics.csv"), index=False)
+    df_gmm.to_csv(Path(args.outdir,"figure_gmm_metrics.csv").with_name("gmm_metrics.csv"), index=False)
+    df_elbow.to_csv(Path(args.outdir,"kmeans_elbow.csv"), index=False)
+    df_gmm[["K","AIC","BIC"]].to_csv(Path(args.outdir,"gmm_aic_bic.csv"), index=False)
+
+    # plots
+    def lineplot(df, ys, title, out):
+        plt.figure(figsize=(7.5,4.5))
+        for y in ys:
+            if y in df.columns: plt.plot(df["K"], df[y], marker="o", label=y)
+        plt.legend(); plt.title(title); plt.xlabel("K"); plt.tight_layout(); plt.savefig(Path(args.outdir, out)); plt.close()
+
+    lineplot(df_km, ["silhouette","davies_bouldin","calinski_harabasz"], "KMEANS metrics vs K", "figure_kmeans_metrics.png")
+    lineplot(df_gmm, ["silhouette","davies_bouldin","calinski_harabasz","AIC","BIC"], "GMM metrics vs K", "figure_gmm_metrics.png")
+
+    plt.figure(figsize=(6.5,4.2))
+    plt.plot(df_elbow["K"], df_elbow["inertia"], marker="o")
+    plt.title("KMeans Elbow"); plt.xlabel("K"); plt.ylabel("Inertia"); plt.tight_layout()
+    plt.savefig(Path(args.outdir,"figure_kmeans_elbow.png")); plt.close()
+
+    plt.figure(figsize=(6.5,4.2))
+    plt.plot(df_gmm["K"], df_gmm["AIC"], marker="o", label="AIC")
+    plt.plot(df_gmm["K"], df_gmm["BIC"], marker="o", label="BIC")
+    plt.title("GMM AIC/BIC vs K"); plt.xlabel("K"); plt.legend(); plt.tight_layout()
+    plt.savefig(Path(args.outdir,"figure_gmm_aic_bic.png")); plt.close()
+
+    # Bootstrap stability (ARI) for KMeans and GMM
+    reps=int(args.bootstrap_reps)
+    def bootstrap_ari(model_name, k):
+        labels_full=None
+        if model_name=="kmeans":
+            labels_full=KMeans(n_clusters=k, n_init=50, random_state=args.random_state).fit_predict(Zp)
+            fit=lambda X: KMeans(n_clusters=k, n_init=10, random_state=args.random_state).fit_predict(X)
+        else:
+            gmm=GaussianMixture(n_components=k, n_init=10, random_state=args.random_state).fit(Zp)
+            labels_full=gmm.predict(Zp)
+            fit=lambda X: GaussianMixture(n_components=k, n_init=5, random_state=args.random_state).fit(X).predict(X)
+
+        ari=[]
+        for _ in range(reps):
+            idx=rng.integers(0, Zp.shape[0], size=Zp.shape[0])
+            lab_boot=fit(Zp[idx]); ari.append(adjusted_rand_score(labels_full[idx], lab_boot))
+        return float(np.mean(ari))
+
+    stab_rows=[]
+    for k in range(max(2,args.kmin), min(args.kmax, Zp.shape[0]-1)+1):
+        try: ari_km=bootstrap_ari("kmeans", k)
+        except Exception: ari_km=np.nan
+        try: ari_g=bootstrap_ari("gmm", k)
+        except Exception: ari_g=np.nan
+        stab_rows.append(dict(K=k, stability_ari_kmeans=ari_km, stability_ari_gmm=ari_g))
+    df_stab=pd.DataFrame(stab_rows); df_stab.to_csv(Path(args.outdir,"phase2_stability_details.csv"), index=False)
+
+    # choose "best" model (heuristic: maximize silhouette, then CH, penalize DBI; tie-break on stability)
+    def pick_best():
+        cand=[]
+        for _,r in df_km.iterrows():
+            score=(r["silhouette"] if pd.notna(r["silhouette"]) else -1) + \
+                  (r["calinski_harabasz"]/1000 if pd.notna(r["calinski_harabasz"]) else 0) - \
+                  (r["davies_bouldin"] if pd.notna(r["davies_bouldin"]) else 0)
+            stab=df_stab.loc[df_stab["K"]==r["K"],"stability_ari_kmeans"].values
+            cand.append(("kmeans", int(r["K"]), float(score), float(stab[0]) if len(stab) else np.nan))
+        for _,r in df_gmm.iterrows():
+            score=(r["silhouette"] if pd.notna(r["silhouette"]) else -1) + \
+                  (r["calinski_harabasz"]/1000 if pd.notna(r["calinski_harabasz"]) else 0) - \
+                  (r["davies_bouldin"] if pd.notna(r["davies_bouldin"]) else 0)
+            stab=df_stab.loc[df_stab["K"]==r["K"],"stability_ari_gmm"].values
+            cand.append(("gmm", int(r["K"]), float(score), float(stab[0]) if len(stab) else np.nan))
+        dfc=pd.DataFrame(cand, columns=["model","K","score","stability"])
+        dfc["rank"]=(-dfc["score"]).argsort().argsort()+1
+        dfc=dfc.sort_values(["rank","stability"], ascending=[True, False]).reset_index(drop=True)
+        best=dfc.iloc[0].to_dict()
+        Path(args.outdir,"phase2_k_selection.csv").write_text(dfc.to_csv(index=False))
+        Path(args.outdir,"phase2_best_model.json").write_text(json.dumps(best, indent=2))
+        return dfc
+    pick_best()
+
+    # --- 11) Manifest
+    outputs = [
+        "pillar_zscores.csv",
+        "efa_loadings.csv","efa_communalities.csv","efa_rotation_matrix.csv",
+        "efa_factor_scores.csv","efa_corr_matrix.csv","efa_corr_eigenvalues.csv",
+        "figure_efa_loadings_heatmap.png",
+        "cfa_indicator_audit.csv",
+        "pillar_convergent_validity_spearman.csv",
+        "rank_comparison_cfa_vs_z.csv","figure_rank_scatter_cfa_vs_z.png",
+        "kmeans_metrics.csv","gmm_metrics.csv","kmeans_elbow.csv","gmm_aic_bic.csv",
+        "figure_kmeans_metrics.png","figure_gmm_metrics.png","figure_kmeans_elbow.png","figure_gmm_aic_bic.png",
+        "phase2_stability_details.csv","phase2_k_selection.csv","phase2_best_model.json",
+    ]
+    if not args.assume_standardized: outputs.append("scaler_mean_std.csv")
+    if have_semopy:
+        outputs += ["cfa_standardized_loadings.csv","cfa_fit_indices.csv"]
+        if cfa_factor_scores is not None: outputs.append("cfa_factor_scores.csv")
+        if cfa_factor_corr is not None: outputs += ["cfa_factor_correlations.csv","figure_cfa_factor_corr.png"]
+
+    manifest=dict(
+        input_data=args.data, mapping_file=args.mapping, outdir=args.outdir, id_col=args.id_col,
+        n_obs=int(n_obs), n_vars=int(n_vars), pillars=pillars, rotation=args.rotation,
+        scaling_mode=scaling_mode, n_factors_requested=(args.n_factors or None), n_factors_used=int(n_factors),
+        small_n_flag=bool(small_n_flag), cfa_run=bool(have_semopy),
+        cfa_estimator=(chosen_obj if "chosen_obj" in locals() else None),
+        random_state=int(args.random_state),
+        k_range=[int(max(2,args.kmin)), int(min(args.kmax, Zp.shape[0]-1))],
+        bootstrap_reps=int(args.bootstrap_reps),
+        dropped_collinear=dropped, collinearity_threshold=0.97,
+        outputs=outputs
+    )
+    Path(args.outdir,"manifest_phase2.json").write_text(json.dumps(manifest, indent=2))
+    print("[OK] Phase 2 (Unified) artifacts written to:", args.outdir)
+
+if __name__=="__main__":
+    main()
